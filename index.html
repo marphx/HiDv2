@@ -11741,6 +11741,314 @@ html.bigger-engaged .stereo-block::after{content:'LOW + AIR';position:absolute;r
      can't reach their interval IDs, but we don't have to —
      they're idempotent. Our own supervisor runs at a wider
      cadence (2s) and stops after the system stabilizes.
+  /* ============================================================
+     15. LEGATO + CHROMA RECORDING FIX  (USER-REPORTED BUGS)
+     ============================================================
+     User reports:
+       (a) "Slide captures don't replay the true notes I played"
+       (b) "Legato should sound really smooth and clean as I slide"
+     
+     ROOT CAUSE (a) — CUMULATIVE PITCH DRIFT IN V25 PLAYBACK:
+       V25's playback function glidePadVoice computes each
+       oscillator's ratio-to-fundamental from osc.frequency.value
+       on EVERY glide event. During fast slides, osc.frequency
+       is mid-glide between the previous target and the new one,
+       so the recomputed "ratio" drifts cumulatively. For multi-
+       oscillator patches (sawtooth+detune layers, octave layers,
+       FM), the pitches drift off-target during the slide.
+       V29's LIVE engine fixed this in 10444-10477 by capturing
+       stable ratios ONCE at voice start. V25's PLAYBACK never
+       got the fix — so recordings don't sound like live.
+     
+     ROOT CAUSE (b) — V25 chroma capture only fires in legato/
+     mono modes (its chromaHit() returns null for poly).
+     A user sliding in poly mode captures a stack of on/off
+     events that plays back as a pile-up chord, not a slide.
+     
+     FIX:
+       1. Install a new padStartSequence override that uses
+          V29-style stable oscillator ratios for chroma gesture
+          playback. Defers to V25 for non-gesture pads.
+       2. Add a V32 chroma gesture capture that runs in POLY
+          mode too (V25 still owns legato/mono capture). Block
+          padCaptureNote on/off events while V32 is recording
+          a gesture so we don't get duplicate noise.
+     ============================================================ */
+  const __v32Glide = {
+    freq(m){ try{ if(typeof freqOf==='function') return freqOf(m); }catch(_){} return 440*Math.pow(2,(m-69)/12); },
+    captureRatios(v, midi){
+      try{
+        const f=this.freq(midi);
+        v._hidV32OscRatios=(v.oscs||[]).map(o=>{
+          const cur=o.osc.frequency.value||f;
+          return Math.max(.125,Math.min(16,cur/Math.max(1,f)));
+        });
+        if(v.fmOsc) v._hidV32FmRatio=Math.max(.125,Math.min(32,(v.fmOsc.frequency.value||f)/Math.max(1,f)));
+        v.midi=midi;
+      }catch(_){ }
+    },
+    glide(v, newMidi, tau){
+      try{
+        if(!v||!v.oscs||typeof ctx==='undefined'||!ctx) return false;
+        if(!v._hidV32OscRatios) this.captureRatios(v, Number.isFinite(+v.midi)?+v.midi:newMidi);
+        const t=ctx.currentTime, newF=this.freq(newMidi);
+        tau=Math.max(.012,Math.min(.95, tau ?? .075));
+        (v.oscs||[]).forEach((o,i)=>{
+          try{
+            const ratio=v._hidV32OscRatios[i]||1;
+            o.osc.frequency.cancelScheduledValues(t);
+            o.osc.frequency.setTargetAtTime(newF*ratio,t,tau);
+          }catch(_){ }
+        });
+        if(v.fmOsc && v.fmOsc.frequency){
+          v.fmOsc.frequency.cancelScheduledValues(t);
+          v.fmOsc.frequency.setTargetAtTime(newF*(v._hidV32FmRatio||1),t,tau);
+        }
+        v.midi=newMidi;
+        return true;
+      }catch(e){ warn('V32 glide failed',e); return false; }
+    }
+  };
+  window.HID_V32_SMOOTH_GLIDE=(v,newMidi,tau)=>__v32Glide.glide(v,newMidi,tau);
+  window.HID_V32_CAPTURE_RATIOS=(v,midi)=>__v32Glide.captureRatios(v,midi);
+
+  /* ---- 15a: V25 PAD-PLAYBACK PITCH-DRIFT FIX ---- */
+  function installV25PlaybackFix(){
+    if(window.__HID_V32_V25_PLAYBACK_FIX__) return true;
+    let pss=null;
+    try{ pss=eval('padStartSequence'); }catch(_){ pss=window.padStartSequence; }
+    if(typeof pss!=='function') return false;
+    if(!pss.__hidV25) return false;       // wait for V25 to have installed
+    if(pss.__hidV32) return true;
+
+    function v32GesturePlayback(idx, p, sustain){
+      try{ if(typeof ensureAudioReady==='function')ensureAudioReady(); else if(typeof initAudio==='function')initAudio(); }catch(_){ }
+      const stState=S(); if(!stState) return;
+      if(typeof ctx==='undefined' || !ctx) return;
+      const evs=Array.isArray(p?.events)?p.events:[];
+      const real=m=>(+m||0)+(p.transpose||0)+(p.octaveShift||0)*12;
+      const allVoices=new Set(), timers=[], activeByMidi=new Map();
+      let activeVoice=null, activeMidi=null, activeMorph=false;
+      const padEl=document.querySelectorAll('#pads-grid .spad')[idx];
+      if(padEl && sustain) padEl.classList.add('sustained');
+      const seq={activeByMidi, allVoices, timers, sustain, loop:!!p.loop, stopped:false, chromaGesture:true};
+      stState.padPlayingSequences=stState.padPlayingSequences || new Map();
+      stState.padPlayingSequences.set(idx, seq);
+
+      function snapFor(morph){
+        try{
+          if(morph && typeof window.HID_V25_MORPH_SNAP==='function') return window.HID_V25_MORPH_SNAP(p);
+          if(typeof padSnapshotForPlayback==='function') return padSnapshotForPlayback(p);
+        }catch(_){ }
+        return p.patchSnapshot;
+      }
+      function startV(ev){
+        try{
+          if(activeVoice){
+            try{ activeVoice.fadeOut?activeVoice.fadeOut(55):activeVoice.release&&activeVoice.release(); }catch(_){ }
+            allVoices.delete(activeVoice);
+          }
+          const r=real(ev.midi);
+          const snap=snapFor(ev.morph);
+          activeVoice=(typeof startVoice==='function')?startVoice(r, ev.vel||.78, snap):null;
+          if(activeVoice){
+            activeVoice.__padIdx=idx;
+            activeVoice.__hidV32GesturePad=true;
+            activeVoice.midi=r;
+            allVoices.add(activeVoice);
+            activeMidi=r;
+            activeMorph=!!ev.morph;
+            __v32Glide.captureRatios(activeVoice, r);
+            try{ if(typeof applyPadLiveParams==='function') applyPadLiveParams(idx); }catch(_){ }
+          }
+        }catch(e){ warn('V32 gesture start failed',e); }
+      }
+      function endV(){
+        if(activeVoice){
+          try{ activeVoice.fadeOut?activeVoice.fadeOut(90):activeVoice.release&&activeVoice.release(); }catch(_){ }
+          allVoices.delete(activeVoice);
+          activeVoice=null;
+          activeMidi=null;
+        }
+      }
+      function slideV(ev){
+        const r=real(ev.midi);
+        if(!activeVoice){ startV(ev); return; }
+        if(!!ev.morph !== activeMorph){
+          // Morph state changed — cross-fade to a new voice (matches the live re-attack on morph change)
+          startV(ev); return;
+        }
+        const tau=Math.max(.012, Math.min(.95, stState?.mod?.glide ?? stState?.modWheel?.glide ?? .075));
+        __v32Glide.glide(activeVoice, r, tau);
+        activeMidi=r;
+      }
+      function scheduleCycle(offsetMs=0){
+        if(seq.stopped) return;
+        evs.forEach(ev=>{
+          const tm=setTimeout(()=>{
+            if(seq.stopped) return;
+            try{
+              if(ev.type==='gestureStart') startV(ev);
+              else if(ev.type==='gestureGlide') slideV(ev);
+              else if(ev.type==='gestureEnd') endV();
+              else if(ev.type==='wheel' && p.wheelEnabled!==false){
+                stState.modWheel=stState.modWheel||{};
+                stState.modWheel.active=ev.value||0;
+                stState.modWheel.target=0;
+              }
+              // 'on'/'off' events from poly-mode captures are skipped here — V32's poly
+              // chroma capture (section 15b) prevents their recording in the first place.
+              // For older recordings that still contain on/off alongside gesture events,
+              // we intentionally ignore them to keep playback monophonic and clean.
+            }catch(e){ warn('V32 event failed',e); }
+          }, offsetMs + Math.max(0,+ev.t||0)*1000);
+          timers.push(tm);
+        });
+        const dur=Math.max(.12, p.duration||1)*1000;
+        if(p.loop && sustain){
+          const tm=setTimeout(()=>scheduleCycle(0), dur);
+          timers.push(tm);
+        } else if(!sustain){
+          const tm=setTimeout(()=>{ try{ if(typeof padStop==='function') padStop(idx, true); }catch(_){ endV(); } }, dur+140);
+          timers.push(tm);
+        }
+      }
+      scheduleCycle(0);
+    }
+
+    const newPSS=function(idx, p, sustain){
+      const evs=Array.isArray(p?.events)?p.events:[];
+      const hasGesture=evs.some(e=>/^gesture(Start|Glide|End)$/.test(e.type));
+      if(hasGesture){ return v32GesturePlayback(idx, p, sustain); }
+      return pss.apply(this, arguments);
+    };
+    newPSS.__hidV32=true;
+    newPSS.__hidV25=true;
+    try{ eval('padStartSequence=newPSS'); }catch(_){ try{ window.padStartSequence=newPSS; }catch(_){ } }
+    try{ window.padStartSequence=newPSS; }catch(_){ }
+
+    window.__HID_V32_V25_PLAYBACK_FIX__=true;
+    info('V25 playback pitch-drift fix installed (chroma gesture pads now use stable oscillator ratios)');
+    return true;
+  }
+
+  /* ---- 15b: POLY-MODE CHROMA GESTURE CAPTURE ---- */
+  const __v32Cap={active:false, pid:null, lastMidi:null, lastMorph:false, lastEventAt:0, lastY:0};
+  function v32ChromaHit(e){
+    const stState=S(); if(!stState) return null;
+    if(stState.padArmedRec<0) return null;
+    if(!stState.chromatic) return null;
+    // V25 already handles legato/mono. V32 only adds POLY-mode capture.
+    const mode=String(stState.voiceMode||'poly').toLowerCase();
+    if(mode==='legato' || mode==='mono') return null;
+    const c=document.getElementById('chroma');
+    if(!c || !c.classList.contains('active')) return null;
+    const els=document.elementsFromPoint(e.clientX, e.clientY) || [];
+    const el=els.find(x=>x?.classList?.contains('chroma-key') && x.closest?.('#chroma') && x.dataset?.midi);
+    if(!el) return null;
+    const r=el.getBoundingClientRect();
+    const yPct=Math.max(0, Math.min(1, (e.clientY-r.top)/Math.max(1,r.height)));
+    const cfg=stState.chromaV24 || stState.chromaV23 || {};
+    const topZone=Math.max(.12, Math.min(.72, cfg.topZone ?? .36));
+    const morph=cfg.topMorph!==false && yPct<=topZone;
+    return {midi:+el.dataset.midi, morph, yPct};
+  }
+  function v32PushCapture(ev){
+    const stState=S(); if(!stState || stState.padArmedRec<0) return;
+    if(!Array.isArray(stState.padCaptureEvents)) stState.padCaptureEvents=[];
+    if(!stState.padCaptureStart){
+      try{ stState.padCaptureStart=(typeof ctx!=='undefined' && ctx)?ctx.currentTime:(performance.now()/1000); }
+      catch(_){ stState.padCaptureStart=performance.now()/1000; }
+    }
+    let t;
+    try{ t=(typeof ctx!=='undefined' && ctx)?(ctx.currentTime - stState.padCaptureStart):(performance.now()/1000 - stState.padCaptureStart); }
+    catch(_){ t=0; }
+    ev.t=+Math.max(0,t).toFixed(4);
+    stState.padCaptureEvents.push(ev);
+    // Reset auto-finalize timer like the original padCaptureNote does
+    try{ if(stState.padCaptureTimer) clearTimeout(stState.padCaptureTimer); stState.padCaptureTimer=setTimeout(()=>{ try{ padFinalizeCapture(); }catch(_){ } }, 3200); }catch(_){ }
+  }
+  function installPolyChromaCapture(){
+    if(window.__HID_V32_POLY_CAPTURE__) return true;
+    window.__HID_V32_POLY_CAPTURE__=true;
+    window.addEventListener('pointerdown', e=>{
+      const h=v32ChromaHit(e); if(!h) return;
+      __v32Cap.active=true; __v32Cap.pid=e.pointerId;
+      __v32Cap.lastMidi=h.midi; __v32Cap.lastMorph=h.morph;
+      __v32Cap.lastEventAt=performance.now(); __v32Cap.lastY=h.yPct;
+      window.__HID_V32_CHROMA_GESTURE_ACTIVE__=true;
+      v32PushCapture({type:'gestureStart', midi:h.midi, morph:h.morph, y:h.yPct, mode:'poly', source:'chroma-v32'});
+    }, {capture:true, passive:true});
+    window.addEventListener('pointermove', e=>{
+      if(!__v32Cap.active || e.pointerId!==__v32Cap.pid) return;
+      const h=v32ChromaHit(e); if(!h) return;
+      const t=performance.now();
+      if(h.midi!==__v32Cap.lastMidi || h.morph!==__v32Cap.lastMorph || (t-__v32Cap.lastEventAt)>85){
+        __v32Cap.lastMidi=h.midi; __v32Cap.lastMorph=h.morph; __v32Cap.lastEventAt=t; __v32Cap.lastY=h.yPct;
+        v32PushCapture({type:'gestureGlide', midi:h.midi, morph:h.morph, y:h.yPct, mode:'poly', source:'chroma-v32'});
+      }
+    }, {capture:true, passive:true});
+    ['pointerup','pointercancel','lostpointercapture'].forEach(type=>{
+      window.addEventListener(type, e=>{
+        if(!__v32Cap.active || (type!=='lostpointercapture' && e.pointerId!==__v32Cap.pid)) return;
+        v32PushCapture({type:'gestureEnd', midi:__v32Cap.lastMidi, morph:__v32Cap.lastMorph, y:__v32Cap.lastY, source:'chroma-v32'});
+        __v32Cap.active=false; __v32Cap.pid=null;
+        window.__HID_V32_CHROMA_GESTURE_ACTIVE__=false;
+      }, {capture:true, passive:true});
+    });
+    info('V32 poly-mode chroma gesture capture installed');
+    return true;
+  }
+
+  /* ---- 15c: PAD CAPTURE NOTE OVERRIDE (skip on/off during V32 gestures) ---- */
+  function installPadCaptureFilter(){
+    if(window.__HID_V32_PAD_CAPTURE_FILTER__) return true;
+    let original=null;
+    try{ original=eval('padCaptureNote'); }catch(_){ original=window.padCaptureNote; }
+    if(typeof original !== 'function') return false;
+
+    const newFn=function(midi, onOff, extra){
+      // Skip on/off events while V32 is recording a poly-mode chroma gesture,
+      // so the recording is a clean monophonic glide rather than a chord stack.
+      if(window.__HID_V32_CHROMA_GESTURE_ACTIVE__ && (onOff==='on' || onOff==='off')) return;
+      return original.apply(this, arguments);
+    };
+    newFn.__hidV32=true;
+    try{ eval('padCaptureNote=newFn'); }catch(_){ try{ window.padCaptureNote=newFn; }catch(_){ } }
+    try{ window.padCaptureNote=newFn; }catch(_){ }
+    window.__HID_V32_PAD_CAPTURE_FILTER__=true;
+    info('V32 padCaptureNote filter installed (suppresses on/off duplicates during gesture capture)');
+    return true;
+  }
+
+  /* ---- 15d: V29 LIVE LEGATO POLISH ---- */
+  /* Tighten the live legato glide a touch so fast slides feel responsive but slow
+     slides still feel smooth. Defaults to a slightly snappier tau if the user hasn't
+     set their own. Idempotent — only applies once. */
+  function installLegatoLivePolish(){
+    if(window.__HID_V32_LEGATO_LIVE__) return true;
+    const stState=S(); if(!stState) return false;
+    stState.mod=stState.mod||{};
+    stState.modWheel=stState.modWheel||{};
+    // Only set if the user truly has nothing set yet (both undefined OR at base defaults)
+    if(stState.mod.glide==null && stState.modWheel.glide==null){
+      stState.mod.glide=0.045;
+      stState.modWheel.glide=0.045;
+      info('V32 set initial legato glide to 0.045s (was default ~0.075). Adjust in Sound Design / Mod Wheel if desired.');
+    }
+    window.__HID_V32_LEGATO_LIVE__=true;
+    return true;
+  }
+
+  function installLegatoAndRecordingFixes(){
+    try{ installV25PlaybackFix(); }catch(e){ warn('V25 playback fix skipped',e); }
+    try{ installPolyChromaCapture(); }catch(e){ warn('Poly chroma capture skipped',e); }
+    try{ installPadCaptureFilter(); }catch(e){ warn('Pad capture filter skipped',e); }
+    try{ installLegatoLivePolish(); }catch(e){ warn('Legato live polish skipped',e); }
+  }
+
+  /* ============================================================
+     SUPERVISOR — runs each installation safely, capped duration
      ============================================================ */
   let __v32Runs=0;
   let __v32Interval=null;
@@ -11758,6 +12066,7 @@ html.bigger-engaged .stereo-block::after{content:'LOW + AIR';position:absolute;r
       dedupeLaunchers();
       cleanRibbon();
       emergencyRemoteVisibility();
+      installLegatoAndRecordingFixes();
     }catch(e){warn('Supervisor cycle error',e)}
     __v32Runs++;
     // After 40 cycles (~80s) the app is fully settled. Stop polling.
